@@ -222,14 +222,21 @@ public:
         size_t granularity = CUDAUtils::cu_mem_get_granularity(device);
         size_t aligned_size = (size + granularity - 1) & ~(granularity - 1);
 
-        // Reserve aligned memory address, rocm will check granularity
-        CURESULT_CHECK(hipMemAddressReserve((hipDeviceptr_t *)ptr, aligned_size, granularity, 0, 0));
 
         // Create allocation metadata
         _AllocationMetadata metadata;
         metadata.size = size;
         metadata.aligned_size = aligned_size;
         metadata.device = device;
+        
+        // rewrite numa node 
+        uint64_t node_id = 0;
+        if (device > 3) {
+            node_id = 1;
+        }
+
+        // Reserve aligned memory address, rocm will check granularity
+        CURESULT_CHECK(hipMemAddressReserve((hipDeviceptr_t *)ptr, aligned_size, granularity, 0, node_id));
 
         // Create and map chunks
         CUDAUtils::cu_mem_create_and_map(device, size, (hipDeviceptr_t)*ptr, 
