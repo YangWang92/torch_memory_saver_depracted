@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <vector>
+#include <sstream>
+#include <cstdlib>
 
 // #define TMS_DEBUG_LOG
 
@@ -130,17 +132,17 @@ namespace CUDAUtils {
         // Calculate chunk sizes
         for (size_t i = 0; i < num_chunks; ++i) {
             chunk_sizes[i] = MIN(size - i * aligned_chunk_size, aligned_chunk_size);
-#ifdef TMS_DEBUG_LOG
-            std::cout << "[torch_memory_saver.cpp] chunk_sizes[" << i << "] = " << chunk_sizes[i] << std::endl;
-#endif
+// #ifdef TMS_DEBUG_LOG
+//             std::cout << "[torch_memory_saver.cpp] chunk_sizes[" << i << "] = " << chunk_sizes[i] << std::endl;
+// #endif
         }
 
         // Create memory handles for each chunk
         for (size_t i = 0; i < num_chunks; ++i) {
             CURESULT_CHECK(hipMemCreate(&allocHandles[i], chunk_sizes[i], &prop, 0));
-#ifdef TMS_DEBUG_LOG
-            std::cout << "[torch_memory_saver.cpp] allocHandles[" << i << "] = " << allocHandles[i] << std::endl;
-#endif
+// #ifdef TMS_DEBUG_LOG
+//             std::cout << "[torch_memory_saver.cpp] allocHandles[" << i << "] = " << allocHandles[i] << std::endl;
+// #endif
         }
 
         // Map each chunk
@@ -149,9 +151,9 @@ namespace CUDAUtils {
             void* map_addr = (void*)((uintptr_t)d_mem + allocated_size);
             CURESULT_CHECK(hipMemMap((hipDeviceptr_t)map_addr, chunk_sizes[i], 0, allocHandles[i], 0));
             allocated_size += chunk_sizes[i];
-#ifdef TMS_DEBUG_LOG
-            std::cout << "[torch_memory_saver.cpp] mapped chunk " << i << " at offset " << allocated_size - chunk_sizes[i] << std::endl;
-#endif
+// #ifdef TMS_DEBUG_LOG
+//             std::cout << "[torch_memory_saver.cpp] mapped chunk " << i << " at offset " << allocated_size - chunk_sizes[i] << std::endl;
+// #endif
         }
 
         // Set access permissions
@@ -173,17 +175,17 @@ namespace CUDAUtils {
             void* map_addr = (void*)((uintptr_t)d_mem + allocated_size);
             CURESULT_CHECK(hipMemUnmap((hipDeviceptr_t)map_addr, chunk_sizes[i]));
             allocated_size += chunk_sizes[i];
-#ifdef TMS_DEBUG_LOG
-            std::cout << "[torch_memory_saver.cpp] unmapped chunk " << i << " at offset " << allocated_size - chunk_sizes[i] << std::endl;
-#endif
+// #ifdef TMS_DEBUG_LOG
+//             std::cout << "[torch_memory_saver.cpp] unmapped chunk " << i << " at offset " << allocated_size - chunk_sizes[i] << std::endl;
+// #endif
         }
 
         // Release each handle
         for (size_t i = 0; i < allocHandles.size(); ++i) {
             CURESULT_CHECK(hipMemRelease(allocHandles[i]));
-#ifdef TMS_DEBUG_LOG
-            std::cout << "[torch_memory_saver.cpp] released allocHandles[" << i << "]" << std::endl;
-#endif
+// #ifdef TMS_DEBUG_LOG
+//             std::cout << "[torch_memory_saver.cpp] released allocHandles[" << i << "]" << std::endl;
+// #endif
         }
     }
 
@@ -210,6 +212,45 @@ struct _AllocationMetadata {
     std::vector<size_t> chunk_sizes;
 };
 
+
+namespace DeviceUtils {
+    // Simple function to get global device ID from local device ID
+    static int get_global_device_id(hipDevice_t local_device_id) {
+        // Check for HIP_VISIBLE_DEVICES environment variable
+        const char* hip_visible = std::getenv("HIP_VISIBLE_DEVICES");
+        
+        if (hip_visible && strlen(hip_visible) > 0) {
+            std::string devices_str(hip_visible);
+            std::stringstream ss(devices_str);
+            std::string device_str;
+            std::vector<int> device_list;
+            
+            // Parse comma-separated device list
+            while (std::getline(ss, device_str, ',')) {
+                if (!device_str.empty()) {
+                    device_list.push_back(std::atoi(device_str.c_str()));
+                }
+            }
+            
+            if (local_device_id < device_list.size()) {
+                int global_device_id = device_list[local_device_id];
+#ifdef TMS_DEBUG_LOG
+                std::cout << "[torch_memory_saver.cpp] HIP_VISIBLE_DEVICES=" << hip_visible 
+                          << " local_device_id=" << local_device_id 
+                          << " -> global_device_id=" << global_device_id << std::endl;
+#endif
+                return global_device_id;
+            }
+        }
+        
+        // Fallback: return local device ID as-is
+#ifdef TMS_DEBUG_LOG
+        std::cout << "[torch_memory_saver.cpp] No HIP_VISIBLE_DEVICES, using local_device_id=" << local_device_id << std::endl;
+#endif
+        return local_device_id;
+    }
+}
+
 class TorchMemorySaver {
 public:
     TorchMemorySaver() {}
@@ -228,12 +269,26 @@ public:
         metadata.size = size;
         metadata.aligned_size = aligned_size;
         metadata.device = device;
-        
+
+        // Get global device ID using our utility function
+        int global_device_id = DeviceUtils::get_global_device_id(device);
+
         // rewrite numa node 
         uint64_t node_id = 0;
-        if (device > 3) {
+        if (global_device_id > 3) {
             node_id = 1;
         }
+
+#ifdef TMS_DEBUG_LOG
+        std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_malloc "
+                  << " ptr=" << ptr << " *ptr=" << *ptr << " size=" << size
+                  << " granularity=" << granularity
+                  << " aligned_size=" << aligned_size
+                  << " node_id=" << node_id
+                  << " device=" << device
+                  << " global_device_id=" << global_device_id
+                  << std::endl;
+#endif
 
         // Reserve aligned memory address, rocm will check granularity
         CURESULT_CHECK(hipMemAddressReserve((hipDeviceptr_t *)ptr, aligned_size, granularity, 0, node_id));

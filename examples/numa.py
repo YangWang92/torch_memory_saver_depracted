@@ -17,11 +17,11 @@ pauseable_tensors = []
 
 for device_id in range(num_devices):
     device = f'cuda:{device_id}'
-    normal_tensor = torch.full((4_000_000_000,), 100, dtype=torch.uint8, device=device)
+    normal_tensor = torch.full((40_000_000_000,), 100, dtype=torch.uint8, device=device)
     print(f'{normal_tensor=}')
     normal_tensors.append(normal_tensor)
     with memory_saver.region():
-        pauseable_tensor = torch.full((4_000_000_000,), 100, dtype=torch.uint8, device=device)
+        pauseable_tensor = torch.full((40_000_000_000,), 100, dtype=torch.uint8, device=device)
         print(f'{pauseable_tensor=}')
         pauseable_tensors.append(pauseable_tensor)
 
