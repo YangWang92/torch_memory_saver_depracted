@@ -108,7 +108,7 @@ namespace APIForwarder {
 
 namespace CUDAUtils {
     static void cu_mem_create_and_map(hipDevice_t device, 
-                                      size_t size, 
+                                      size_t aligned_size, 
                                       void* d_mem,
                                       std::vector<hipMemGenericAllocationHandle_t>& allocHandles,
                                       std::vector<size_t>& chunk_sizes) {
@@ -117,21 +117,14 @@ namespace CUDAUtils {
         prop.location.type = hipMemLocationTypeDevice;
         prop.location.id = device;
 
-        // Get granularity
-        size_t granularity;
-        CURESULT_CHECK(hipMemGetAllocationGranularity(&granularity, &prop,
-                                               hipMemAllocationGranularityMinimum));
-
-        // Make sure chunk size is aligned with hardware granularity
-        size_t aligned_chunk_size = ((MEMCREATE_CHUNK_SIZE + granularity - 1) / granularity) * granularity;
-        size_t num_chunks = (size + aligned_chunk_size - 1) / aligned_chunk_size;
+        size_t num_chunks = (aligned_size + MEMCREATE_CHUNK_SIZE - 1) / MEMCREATE_CHUNK_SIZE;
 
         allocHandles.resize(num_chunks);
         chunk_sizes.resize(num_chunks);
 
         // Calculate chunk sizes
         for (size_t i = 0; i < num_chunks; ++i) {
-            chunk_sizes[i] = MIN(size - i * aligned_chunk_size, aligned_chunk_size);
+            chunk_sizes[i] = MIN(aligned_size - i * MEMCREATE_CHUNK_SIZE, MEMCREATE_CHUNK_SIZE);
 // #ifdef TMS_DEBUG_LOG
 //             std::cout << "[torch_memory_saver.cpp] chunk_sizes[" << i << "] = " << chunk_sizes[i] << std::endl;
 // #endif
@@ -161,20 +154,20 @@ namespace CUDAUtils {
         accessDesc.location.type = hipMemLocationTypeDevice;
         accessDesc.location.id = device;
         accessDesc.flags = hipMemAccessFlagsProtReadWrite;
-        CURESULT_CHECK(hipMemSetAccess(d_mem, size, &accessDesc, 1));
+        CURESULT_CHECK(hipMemSetAccess(d_mem, aligned_size, &accessDesc, 1));
     }
 
     static void cu_mem_unmap_and_release(hipDevice_t device,
-                                         size_t size,
+                                         size_t aligned_size,
                                          hipDeviceptr_t d_mem,
                                          const std::vector<hipMemGenericAllocationHandle_t>& allocHandles,
                                          const std::vector<size_t>& chunk_sizes) {
         // Unmap each chunk
-        size_t allocated_size = 0;
+        size_t deallocated_size = 0;
         for (size_t i = 0; i < allocHandles.size(); ++i) {
-            void* map_addr = (void*)((uintptr_t)d_mem + allocated_size);
+            void* map_addr = (void*)((uintptr_t)d_mem + deallocated_size);
             CURESULT_CHECK(hipMemUnmap((hipDeviceptr_t)map_addr, chunk_sizes[i]));
-            allocated_size += chunk_sizes[i];
+            deallocated_size += chunk_sizes[i];
 // #ifdef TMS_DEBUG_LOG
 //             std::cout << "[torch_memory_saver.cpp] unmapped chunk " << i << " at offset " << allocated_size - chunk_sizes[i] << std::endl;
 // #endif
@@ -259,10 +252,21 @@ public:
         hipDevice_t device;
         CURESULT_CHECK(hipCtxGetDevice(&device));
 
-        // Get granularity and calculate aligned size
-        size_t granularity = CUDAUtils::cu_mem_get_granularity(device);
-        size_t aligned_size = (size + granularity - 1) & ~(granularity - 1);
+        hipMemAllocationProp prop = {};
+        prop.type = hipMemAllocationTypePinned;
+        prop.location.type = hipMemLocationTypeDevice;
+        prop.location.id = device;
+        prop.allocFlags.compressionType = 0x0;
 
+        size_t granularity;
+        CURESULT_CHECK(hipMemGetAllocationGranularity(&granularity, &prop,
+                                               hipMemAllocationGranularityMinimum));
+        size_t aligned_size = ((size + granularity - 1) / granularity) * granularity;
+        aligned_size = (aligned_size + MEMCREATE_CHUNK_SIZE - 1) / MEMCREATE_CHUNK_SIZE * MEMCREATE_CHUNK_SIZE;
+
+        assert(MEMCREATE_CHUNK_SIZE % granularity == 0);
+        assert(aligned_size % MEMCREATE_CHUNK_SIZE == 0);
+        assert(aligned_size % granularity == 0);
 
         // Create allocation metadata
         _AllocationMetadata metadata;
@@ -289,12 +293,13 @@ public:
                   << " global_device_id=" << global_device_id
                   << std::endl;
 #endif
-
+        hipDeviceptr_t d_mem;
         // Reserve aligned memory address, rocm will check granularity
-        CURESULT_CHECK(hipMemAddressReserve((hipDeviceptr_t *)ptr, aligned_size, granularity, 0, node_id));
+        CURESULT_CHECK(hipMemAddressReserve(&d_mem, aligned_size, granularity, 0, node_id));
+        *ptr = (void*)d_mem;
 
         // Create and map chunks
-        CUDAUtils::cu_mem_create_and_map(device, size, (hipDeviceptr_t)*ptr, 
+        CUDAUtils::cu_mem_create_and_map(device, aligned_size, (hipDeviceptr_t)*ptr, 
                                          metadata.allocHandles, metadata.chunk_sizes);
 
         size_t num_chunks = metadata.allocHandles.size();
@@ -307,6 +312,7 @@ public:
 #ifdef TMS_DEBUG_LOG
         std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_malloc "
                   << " ptr=" << ptr << " *ptr=" << *ptr << " size=" << size
+                  << " metadata.aligned_size=" << metadata.aligned_size
                   << " num_chunks=" << num_chunks
                   << std::endl;
 #endif
@@ -333,6 +339,7 @@ public:
 #ifdef TMS_DEBUG_LOG
         std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_free "
                   << " ptr=" << ptr << " metadata.size=" << metadata.size
+                  << " metadata.aligned_size=" << metadata.aligned_size
                   << " num_chunks=" << metadata.allocHandles.size()
                   << std::endl;
 #endif
@@ -348,12 +355,13 @@ public:
             _AllocationMetadata &metadata = it->second;
 
             // Unmap and release chunks (but keep metadata for resume)
-            CUDAUtils::cu_mem_unmap_and_release(metadata.device, metadata.size,
+            CUDAUtils::cu_mem_unmap_and_release(metadata.device, metadata.aligned_size,
                                                 (hipDeviceptr_t)ptr, metadata.allocHandles, metadata.chunk_sizes);
 
 #ifdef TMS_DEBUG_LOG
             std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.pause"
-                      << " ptr=" << ptr << " metadata.size=" << metadata.size 
+                      << " ptr=" << ptr << " metadata.size=" << metadata.size
+                      << " metadata.aligned_size=" << metadata.aligned_size
                       << " num_chunks=" << metadata.allocHandles.size()
                       << std::endl;
 #endif
@@ -368,12 +376,13 @@ public:
             _AllocationMetadata &metadata = it->second;
 
             // Create new handles and map chunks
-            CUDAUtils::cu_mem_create_and_map(metadata.device, metadata.size,
+            CUDAUtils::cu_mem_create_and_map(metadata.device, metadata.aligned_size,
                                              (hipDeviceptr_t)ptr, metadata.allocHandles, metadata.chunk_sizes);
 
 #ifdef TMS_DEBUG_LOG
             std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.resume"
                       << " ptr=" << ptr << " metadata.size=" << metadata.size
+                      << " metadata.aligned_size=" << metadata.aligned_size
                       << " num_chunks=" << metadata.allocHandles.size()
                       << std::endl;
 #endif
